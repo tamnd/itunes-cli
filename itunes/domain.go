@@ -1,77 +1,91 @@
+// Package itunes exposes the iTunes Search API as a kit Domain driver.
+//
+// A multi-domain host (ant) enables it with a single blank import:
+//
+//	import _ "github.com/tamnd/itunes-cli/itunes"
+//
+// The same Domain also builds the standalone itunes binary (see cli.NewApp).
 package itunes
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes itunes as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/itunes-cli/itunes"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// itunes:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone itunes binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the itunes driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the itunes driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "itunes",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "itunes",
-			Short:  "A command line for itunes.",
-			Long: `A command line for itunes.
-
-itunes reads public itunes data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+			Short:  "Search the iTunes catalog for songs, albums, artists, podcasts and more",
+			Long: `itunes searches the free iTunes Search API (itunes.apple.com).
+No API key required. Search for songs, albums, artists, movies, podcasts,
+and software by term or look up any item by Apple ID.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/itunes-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `itunes page` and
-	// `ant get itunes://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// search: general search
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "read",
+		List:    true,
+		Summary: "Search the iTunes catalog by term",
+	}, searchOp)
 
-	// List op: members of a page, the home of `itunes links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// itunes://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// lookup: lookup by Apple ID
+	kit.Handle(app, kit.OpMeta{
+		Name:    "lookup",
+		Group:   "read",
+		List:    true,
+		Summary: "Look up an item by its Apple ID",
+	}, lookupOp)
+
+	// artist: shortcut for --type musicArtist
+	kit.Handle(app, kit.OpMeta{
+		Name:    "artist",
+		Group:   "read",
+		List:    true,
+		Summary: "Search for artists by name",
+	}, artistOp)
+
+	// album: shortcut for --type album
+	kit.Handle(app, kit.OpMeta{
+		Name:    "album",
+		Group:   "read",
+		List:    true,
+		Summary: "Search for albums by name",
+	}, albumOp)
+
+	// podcast: shortcut for --type podcast
+	kit.Handle(app, kit.OpMeta{
+		Name:    "podcast",
+		Group:   "read",
+		List:    true,
+		Summary: "Search for podcasts by name",
+	}, podcastOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +96,117 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Term    string  `kit:"flag" help:"search term"`
+	Type    string  `kit:"flag" help:"entity type: song, album, musicArtist, movie, tvShow, podcast, software"`
+	Limit   int     `kit:"flag" help:"max results (default 25)"`
+	Country string  `kit:"flag" help:"two-letter country code (default US)"`
+	Client  *Client `kit:"inject"`
+}
+
+type lookupInput struct {
+	ID     int64   `kit:"flag" help:"Apple item ID"`
+	Type   string  `kit:"flag" help:"entity type filter"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type shortcutInput struct {
+	Term    string  `kit:"flag" help:"search term"`
+	Limit   int     `kit:"flag" help:"max results (default 25)"`
+	Country string  `kit:"flag" help:"two-letter country code (default US)"`
+	Client  *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOp(ctx context.Context, in searchInput, emit func(Result) error) error {
+	results, err := in.Client.Search(ctx, in.Term, in.Type, in.Country, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, r := range results {
+		if err := emit(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full itunes.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized itunes reference: %q", input)
+func lookupOp(ctx context.Context, in lookupInput, emit func(Result) error) error {
+	results, err := in.Client.Lookup(ctx, in.ID, in.Type)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func artistOp(ctx context.Context, in shortcutInput, emit func(Result) error) error {
+	results, err := in.Client.Search(ctx, in.Term, "musicArtist", in.Country, in.Limit)
+	if err != nil {
+		return err
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func albumOp(ctx context.Context, in shortcutInput, emit func(Result) error) error {
+	results, err := in.Client.Search(ctx, in.Term, "album", in.Country, in.Limit)
+	if err != nil {
+		return err
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func podcastOp(ctx context.Context, in shortcutInput, emit func(Result) error) error {
+	results, err := in.Client.Search(ctx, in.Term, "podcast", in.Country, in.Limit)
+	if err != nil {
+		return err
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver ---
+
+// Classify turns an input into the canonical (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("empty itunes reference")
+	}
+	return "result", input, nil
+}
+
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "result":
+		return fmt.Sprintf("https://%s/lookup?id=%s", Host, id), nil
+	default:
 		return "", errs.Usage("itunes has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
