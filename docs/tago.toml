@@ -1,0 +1,10 @@
+title       = "itunes"
+baseURL     = "https://itunes-cli.tamnd.com/"
+description = "A command line for itunes."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/itunes-cli"
